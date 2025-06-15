@@ -1,0 +1,45 @@
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+type Query {
+  getWorkflowStatus(workflowId: ID!): WorkflowStatus
+  getWorkflowResult(workflowId: ID!): WorkflowResult
+}
+
+type Mutation {
+  startWorkflow(input: WorkflowInput!): WorkflowResponse
+  sendMessage(input: MessageInput!): MessageResponse
+}
+
+input WorkflowInput {
+  input: String!
+}
+
+input MessageInput {
+  input: String!
+  workflowId: ID
+}
+
+type WorkflowResponse {
+  workflowId: ID!
+  status: String!
+}
+
+type MessageResponse {
+  workflowId: ID!
+  message: String!
+  messageId: String!
+}
+
+type WorkflowStatus {
+  workflowId: ID!
+  status: String!
+  currentNode: String
+}
+
+type WorkflowResult {
+  workflowId: ID!
+  result: String
+}

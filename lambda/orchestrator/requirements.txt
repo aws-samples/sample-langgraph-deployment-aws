@@ -1,0 +1,10 @@
+langchain>=0.2.0
+langgraph==0.3.31
+langgraph-checkpoint~=2.0.24
+langgraph-checkpoint-amazon-dynamodb==0.1.1
+langgraph-prebuilt~=0.1.8
+langgraph-sdk~=0.1.61
+requests~=2.32.4
+langchain-aws>=0.2.18
+langchain_tavily
+numpy==2.2.6

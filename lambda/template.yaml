@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LangGraph Agent Workflow with AppSync (No DynamoDB for workflow state)
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 1024
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        REGION: !Ref AWS::Region
+        QUEUE_URL: !Ref WorkflowQueue
+        APPSYNC_ENDPOINT: !GetAtt AgentAPI.GraphQLUrl
+        APPSYNC_API_KEY: !GetAtt AgentAPIKey.ApiKey
+        LANGGRAPH_STATE_TABLE: !Ref LangGraphStateTable
+        TAVILY_API_KEY: "dqwkdoqwkdopwq"
+
+Resources:
+  # DynamoDB Table for LangGraph state
+  LangGraphStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: langgraph-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS Queue for async processing
+  WorkflowQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkflowDLQ.Arn
+        maxReceiveCount: 5
+
+  WorkflowDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Lambda Functions
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./orchestrator/
+      Handler: lambda_handler.handler
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WorkflowQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LangGraphStateTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkflowQueue.Arn
+            BatchSize: 1
+
+  # AppSync API
+  AgentAPI:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: AgentWorkflowAPI
+      AuthenticationType: API_KEY
+      XrayEnabled: true
+
+  AgentAPIKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      Expires: 1767225600        
+      
+  AgentAPISchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      Definition: |
+        schema {
+          query: Query
+          mutation: Mutation
+          subscription: Subscription
+        }
+
+        type Query {
+          # Placeholder query - AppSync requires at least one field in Query type
+          getWorkflowStatus(workflowId: ID!): WorkflowResponse
+        }
+
+        type Mutation {
+          sendMessage(workflowId: ID!, message: String!): WorkflowResponse
+          publishWorkflowResult(workflowId: ID!, result: String!): WorkflowResult
+        }
+
+        type Subscription {
+          onWorkflowComplete(workflowId: ID!): WorkflowResult
+            @aws_subscribe(mutations: ["publishWorkflowResult"])
+        }
+
+        type WorkflowResponse {
+          workflowId: ID!
+          status: String!
+        }
+
+        type WorkflowResult {
+          workflowId: ID!
+          result: String
+        }
+
+  # AppSync Data Sources
+  LambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      Name: LambdaDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt AppSyncResolverFunction.Arn
+
+  NoneDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      Name: NoneDataSource
+      Type: NONE
+
+  # AppSync Resolver Function
+  AppSyncResolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./appsync_resolvers/
+      Handler: resolvers.handler
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WorkflowQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LangGraphStateTable
+        
+  # AppSync Service Role
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt AppSyncResolverFunction.Arn
+
+  # AppSync Resolvers
+  SendMessageResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      TypeName: Mutation
+      FieldName: sendMessage
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "Invoke",
+          "payload": {
+            "field": "sendMessage",
+            "arguments": $utils.toJson($context.arguments)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($context.result)
+
+  GetWorkflowStatusResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      TypeName: Query
+      FieldName: getWorkflowStatus
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "Invoke",
+          "payload": {
+            "field": "getWorkflowStatus",
+            "arguments": $utils.toJson($context.arguments)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($context.result)
+
+  PublishWorkflowResultResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AgentAPI.ApiId
+      TypeName: Mutation
+      FieldName: publishWorkflowResult
+      DataSourceName: !GetAtt NoneDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29"
+        }
+      ResponseMappingTemplate: |
+        #set($result = {
+          "workflowId": $context.arguments.workflowId,
+          "result": $context.arguments.result
+        })
+        $utils.toJson($result)
+
+Outputs:
+  GraphQLApiEndpoint:
+    Description: "GraphQL API Endpoint"
+    Value: !GetAtt AgentAPI.GraphQLUrl
+  
+  GraphQLApiKey:
+    Description: "GraphQL API Key"
+    Value: !GetAtt AgentAPIKey.ApiKey
+  
+  WorkflowQueueUrl:
+    Description: "SQS Queue URL"
+    Value: !Ref WorkflowQueue
+    
+  LangGraphStateTableName:
+    Description: "DynamoDB Table for LangGraph State"
+    Value: !Ref LangGraphStateTable
